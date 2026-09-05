@@ -108,6 +108,8 @@ def handle_trader(conn, addr, reader, username):
                 continue
             command = parts[0]
 
+            MAX_VALUE = 2_147_483_647
+
             if command == "BUY" or command == "SELL":
                 if len(parts) != 4:
                     send_line(conn, "ERROR malformed order")
@@ -119,10 +121,12 @@ def handle_trader(conn, addr, reader, username):
                 try:
                     qty = int(qty_s)
                     price = int(price_s)
-                    if qty <= 0 or price <= 0:
-                        raise ValueError
                 except ValueError:
                     send_line(conn, "ERROR invalid quantity or price")
+                    continue
+
+                if not (1 <= qty <= MAX_VALUE) or not (1 <= price <= MAX_VALUE):
+                    send_line(conn, "ERROR quantity or price out of range")
                     continue
 
                 with state_lock:
