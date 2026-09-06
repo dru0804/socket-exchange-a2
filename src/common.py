@@ -20,11 +20,17 @@ class LineReader:
     def read_line(self):
         """
         Return the next complete message (without the trailing '\\n'),
-        or None if the connection was closed cleanly (recv returned b"").
-        Raises OSError if the underlying recv() fails.
+        or None if the connection was closed cleanly (recv returned b"")
+        or abruptly (RST received).
+        Raises OSError if the underlying recv() fails for other reasons.
         """
         while b"\n" not in self._buffer:
-            chunk = self.sock.recv(self.bufsize)
+            try:
+                chunk = self.sock.recv(self.bufsize)
+            except ConnectionResetError:
+                # Peer sent an RST (abrupt disconnect) instead of a
+                # clean FIN. Treat this the same as a normal close.
+                return None
             if not chunk:
                 # Connection closed. If there's leftover data with no
                 # newline, we discard it (incomplete final message).
