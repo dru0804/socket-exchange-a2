@@ -1,104 +1,76 @@
 #!/usr/bin/env python3
-"""Exchange Server - entry point."""
 
 import socket
 import sys
 import threading
 import itertools
 
-from common import LineReader, send_line
+from common import Linereader, sendl
 
-# ---------------------------------------------------------------------
-# Shared state — all protected by state_lock
-# ---------------------------------------------------------------------
-state_lock = threading.Lock()
-usernames = set()                 # currently logged-in trader usernames
-trader_conns = {}                 # username -> socket connection
-order_book = []                   # list of order dicts (see below)
-order_id_counter = itertools.count(1)
-subscribers = {}                  # instrument -> set of market-data sockets
+slock = threading.Lock()
+usernames = set()            
+tconns = {}               
+orbook = []             
+oridcount = itertools.count(1)
+subscribers = {}            
 
 INSTRUMENTS = {"JNST", "IMCT"}
 
 
-def new_order(order_id, username, side, instrument, qty, price):
+def norder(orid, username, side, instrument, qty, price):
     return {
-        "id": order_id,
+        "id": orid,
         "username": username,
-        "side": side,          # "BUY" or "SELL"
+        "side": side,         
         "instrument": instrument,
-        "qty": qty,            # remaining quantity
+        "qty": qty,         
         "price": price,
     }
 
 
-def try_match(new_order_dict):
-    """
-    Attempt to match new_order_dict against the book. Sends BOUGHT/SOLD
-    to affected traders and TRADE to subscribers as matches occur.
-    Must be called while holding state_lock.
-    """
-    opposite_side = "SELL" if new_order_dict["side"] == "BUY" else "BUY"
+def match(nord):
+    opp = "SELL" if nord["side"] == "BUY" else "BUY"
 
-    for other in order_book:
-        if other is new_order_dict:
-            continue
-        if other["instrument"] != new_order_dict["instrument"]:
-            continue
-        if other["side"] != opposite_side:
-            continue
-        if other["price"] != new_order_dict["price"]:
-            continue
-        if other["qty"] <= 0 or new_order_dict["qty"] <= 0:
+    for other in orbook:
+        if other is nord or other["instrument"] != nord["instrument"] or other["side"] != opp or other["price"] != nord["price"] or other["qty"] <= 0 or nord["qty"] <= 0:
             continue
 
-        traded_qty = min(other["qty"], new_order_dict["qty"])
-        other["qty"] -= traded_qty
-        new_order_dict["qty"] -= traded_qty
+        tradq = min(other["qty"], nord["qty"])
+        other["qty"] -= tradq
+        nord["qty"] -= tradq
+        instrument = nord["instrument"]
+        price = nord["price"]
+        buyord = nord if nord["side"] == "BUY" else other
+        sellord = other if nord["side"] == "BUY" else nord
+        bconn = tconns.get(buyord["username"])
+        sconn = tconns.get(sellord["username"])
 
-        instrument = new_order_dict["instrument"]
-        price = new_order_dict["price"]
-
-        buy_order = new_order_dict if new_order_dict["side"] == "BUY" else other
-        sell_order = other if new_order_dict["side"] == "BUY" else new_order_dict
-
-        buyer_conn = trader_conns.get(buy_order["username"])
-        seller_conn = trader_conns.get(sell_order["username"])
-
-        if buyer_conn is not None:
+        if bconn is not None:
             try:
-                send_line(buyer_conn, f"BOUGHT {instrument} {traded_qty} {price}")
+                sendl(bconn, f"BOUGHT {instrument} {tradq} {price}")
             except OSError:
                 pass
-        if seller_conn is not None:
+        if sconn is not None:
             try:
-                send_line(seller_conn, f"SOLD {instrument} {traded_qty} {price}")
+                sendl(sconn, f"SOLD {instrument} {tradq} {price}")
             except OSError:
                 pass
+        broadcast(instrument, tradq, price)
+        if nord["qty"] <= 0:
+            break  
+    orbook[:] = [o for o in orbook if o["qty"] > 0]
 
-        broadcast_trade(instrument, traded_qty, price)
-
-        if new_order_dict["qty"] <= 0:
-            break  # fully filled, stop matching this order
-
-    # Remove fully-filled orders from the book.
-    order_book[:] = [o for o in order_book if o["qty"] > 0]
-
-
-def broadcast_trade(instrument, qty, price):
-    """Must be called while holding state_lock."""
-    for sub_conn in subscribers.get(instrument, ()):
+def broadcast(instrument, qty, price):
+    for subconn in subscribers.get(instrument, ()):
         try:
-            send_line(sub_conn, f"TRADE {instrument} {qty} {price}")
+            sendl(subconn, f"TRADE {instrument} {qty} {price}")
         except OSError:
             pass
 
-
-def handle_trader(conn, addr, reader, username):
-    """Main loop once a client has identified as a Trader via LOGIN."""
+def handletrad(conn, addr, reader, username):
     try:
         while True:
-            line = reader.read_line()
+            line = reader.readl()
             if line is None:
                 break
 
@@ -107,81 +79,73 @@ def handle_trader(conn, addr, reader, username):
             if not parts:
                 continue
             command = parts[0]
-
             MAX_VALUE = 2_147_483_647
-
             if command == "BUY" or command == "SELL":
                 if len(parts) != 4:
-                    send_line(conn, "ERROR malformed order")
+                    sendl(conn, "ERROR malformed order")
                     continue
                 _, instrument, qty_s, price_s = parts
                 if instrument not in INSTRUMENTS:
-                    send_line(conn, "ERROR unknown instrument")
+                    sendl(conn, "ERROR unknown instrument")
                     continue
                 try:
                     qty = int(qty_s)
                     price = int(price_s)
                 except ValueError:
-                    send_line(conn, "ERROR invalid quantity or price")
+                    sendl(conn, "ERROR invalid quantity or price")
                     continue
 
                 if not (1 <= qty <= MAX_VALUE) or not (1 <= price <= MAX_VALUE):
-                    send_line(conn, "ERROR quantity or price out of range")
+                    sendl(conn, "ERROR quantity or price out of range")
                     continue
 
-                with state_lock:
-                    order_id = next(order_id_counter)
-                    order = new_order(order_id, username, command, instrument, qty, price)
-                    send_line(conn, f"ORDER_ACCEPTED {order_id}")
-                    order_book.append(order)
-                    try_match(order)
+                with slock:
+                    orid = next(oridcount)
+                    order = norder(orid, username, command, instrument, qty, price)
+                    sendl(conn, f"ORDER_ACCEPTED {orid}")
+                    orbook.append(order)
+                    match(order)
 
             elif command == "CANCEL":
                 if len(parts) != 2:
-                    send_line(conn, "ERROR malformed cancel")
+                    sendl(conn, "ERROR malformed cancel")
                     continue
                 try:
-                    target_id = int(parts[1])
+                    tid = int(parts[1])
                 except ValueError:
-                    send_line(conn, "ERROR invalid order id")
+                    sendl(conn, "ERROR invalid order id")
                     continue
 
-                with state_lock:
+                with slock:
                     found = None
-                    for o in order_book:
-                        if o["id"] == target_id and o["username"] == username:
+                    for o in orbook:
+                        if o["id"] == tid and o["username"] == username:
                             found = o
                             break
                     if found is not None:
-                        order_book.remove(found)
-                        send_line(conn, f"ORDER_CANCELLED {target_id}")
+                        orbook.remove(found)
+                        sendl(conn, f"ORDER_CANCELLED {tid}")
                     else:
-                        send_line(conn, "ERROR no such order")
-
+                        sendl(conn, "ERROR no such order")
             elif command == "QUIT":
-                send_line(conn, "OK")
+                sendl(conn, "OK")
                 break
-
             else:
-                send_line(conn, f"ERROR command not allowed for trader")
-
+                sendl(conn, f"ERROR command not allowed for trader")
     finally:
-        with state_lock:
+        with slock:
             usernames.discard(username)
-            trader_conns.pop(username, None)
+            tconns.pop(username, None)
         conn.close()
         print(f"Trader {username} ({addr}) disconnected.")
 
-
-def handle_market_data(conn, addr, reader):
-    """Main loop once a client has identified as Market-Data via SUBSCRIBE."""
-    my_subscriptions = set()
+def handlemdata(conn, addr, reader):
+    subs = set()
     try:
         while True:
-            line = reader.read_line()
+            line = reader.readl()
             if line is None:
                 break
-
             print(f"Received from market-data {addr}: {line!r}")
             parts = line.split()
             if not parts:
@@ -190,98 +154,86 @@ def handle_market_data(conn, addr, reader):
 
             if command == "SUBSCRIBE":
                 if len(parts) != 2 or parts[1] not in INSTRUMENTS:
-                    send_line(conn, "ERROR unknown instrument")
+                    sendl(conn, "ERROR unknown instrument")
                     continue
                 instrument = parts[1]
-                with state_lock:
+                with slock:
                     subscribers.setdefault(instrument, set()).add(conn)
-                my_subscriptions.add(instrument)
-                send_line(conn, "OK")
+                subs.add(instrument)
+                sendl(conn, "OK")
 
             elif command == "UNSUBSCRIBE":
                 if len(parts) != 2 or parts[1] not in INSTRUMENTS:
-                    send_line(conn, "ERROR unknown instrument")
+                    sendl(conn, "ERROR unknown instrument")
                     continue
                 instrument = parts[1]
-                with state_lock:
+                with slock:
                     subscribers.get(instrument, set()).discard(conn)
-                my_subscriptions.discard(instrument)
-                send_line(conn, "OK")
+                subs.discard(instrument)
+                sendl(conn, "OK")
 
             elif command == "QUIT":
-                send_line(conn, "OK")
+                sendl(conn, "OK")
                 break
 
             else:
-                send_line(conn, "ERROR command not allowed for market-data client")
+                sendl(conn, "ERROR command not allowed for market-data client")
 
     finally:
-        with state_lock:
-            for instrument in my_subscriptions:
+        with slock:
+            for instrument in subs:
                 subscribers.get(instrument, set()).discard(conn)
         conn.close()
         print(f"Market-data client {addr} disconnected.")
 
 
-def handle_client(conn: socket.socket, addr):
+def handlec(conn: socket.socket, addr):
     print(f"Client connected: {addr}")
-    reader = LineReader(conn)
-
-    # The first message determines the client's role:
-    #   LOGIN <username>      -> Trader Client
-    #   SUBSCRIBE <instrument> -> Market-Data Client
-    first_line = reader.read_line()
+    reader = Linereader(conn)
+    first_line = reader.readl()
     if first_line is None:
         conn.close()
         return
-
     parts = first_line.split()
     if not parts:
-        send_line(conn, "ERROR empty command")
+        sendl(conn, "ERROR empty command")
         conn.close()
         return
-
     command = parts[0]
-
     if command == "LOGIN":
         if len(parts) != 2:
-            send_line(conn, "ERROR malformed LOGIN")
+            sendl(conn, "ERROR malformed LOGIN")
             conn.close()
             return
         username = parts[1]
-        with state_lock:
+        with slock:
             if username in usernames:
-                send_line(conn, "ERROR username taken")
+                sendl(conn, "ERROR username taken")
                 conn.close()
                 return
             usernames.add(username)
-            trader_conns[username] = conn
-            send_line(conn, "OK")
-        handle_trader(conn, addr, reader, username)
-
+            tconns[username] = conn
+            sendl(conn, "OK")
+        handletrad(conn, addr, reader, username)
     elif command == "SUBSCRIBE":
         if len(parts) != 2 or parts[1] not in INSTRUMENTS:
-            send_line(conn, "ERROR unknown instrument")
+            sendl(conn, "ERROR unknown instrument")
             conn.close()
             return
         instrument = parts[1]
-        with state_lock:
+        with slock:
             subscribers.setdefault(instrument, set()).add(conn)
-        send_line(conn, "OK")
-        handle_market_data_after_first(conn, addr, reader, {instrument})
-
+        sendl(conn, "OK")
+        mdataafter1st(conn, addr, reader, {instrument})
     else:
-        send_line(conn, "ERROR first message must be LOGIN or SUBSCRIBE")
+        sendl(conn, "ERROR first message must be LOGIN or SUBSCRIBE")
         conn.close()
 
-
-def handle_market_data_after_first(conn, addr, reader, initial_subs):
-    """Same as handle_market_data but the first SUBSCRIBE was already
-    processed as the role-determining message."""
-    my_subscriptions = set(initial_subs)
+def mdataafter1st(conn, addr, reader, isubs):
+    subs = set(isubs)
     try:
         while True:
-            line = reader.read_line()
+            line = reader.readl()
             if line is None:
                 break
             print(f"Received from market-data {addr}: {line!r}")
@@ -292,34 +244,34 @@ def handle_market_data_after_first(conn, addr, reader, initial_subs):
 
             if command == "SUBSCRIBE":
                 if len(parts) != 2 or parts[1] not in INSTRUMENTS:
-                    send_line(conn, "ERROR unknown instrument")
+                    sendl(conn, "ERROR unknown instrument")
                     continue
                 instrument = parts[1]
-                with state_lock:
+                with slock:
                     subscribers.setdefault(instrument, set()).add(conn)
-                my_subscriptions.add(instrument)
-                send_line(conn, "OK")
+                subs.add(instrument)
+                sendl(conn, "OK")
 
             elif command == "UNSUBSCRIBE":
                 if len(parts) != 2 or parts[1] not in INSTRUMENTS:
-                    send_line(conn, "ERROR unknown instrument")
+                    sendl(conn, "ERROR unknown instrument")
                     continue
                 instrument = parts[1]
-                with state_lock:
+                with slock:
                     subscribers.get(instrument, set()).discard(conn)
-                my_subscriptions.discard(instrument)
-                send_line(conn, "OK")
+                subs.discard(instrument)
+                sendl(conn, "OK")
 
             elif command == "QUIT":
-                send_line(conn, "OK")
+                sendl(conn, "OK")
                 break
 
             else:
-                send_line(conn, "ERROR command not allowed for market-data client")
+                sendl(conn, "ERROR command not allowed for market-data client")
 
     finally:
-        with state_lock:
-            for instrument in my_subscriptions:
+        with slock:
+            for instrument in subs:
                 subscribers.get(instrument, set()).discard(conn)
         conn.close()
         print(f"Market-data client {addr} disconnected.")
@@ -332,18 +284,15 @@ def main():
 
     host = sys.argv[1]
     port = int(sys.argv[2])
-
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
     srv.listen(20)
     print(f"Exchange Server listening on {host}:{port}")
-
     while True:
         conn, addr = srv.accept()
-        t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+        t = threading.Thread(target=handlec, args=(conn, addr), daemon=True)
         t.start()
-
 
 if __name__ == "__main__":
     main()
